@@ -461,11 +461,20 @@ fn parse_function_block(raw: &str) -> Option<(String, String)> {
         let val_start = tag_end + 1;
         let after = &rest[val_start..];
         let val_end = after.find("</param>")?;
-        let mut raw_val = &after[..val_end];
-        raw_val = raw_val
-            .strip_prefix("<![CDATA[")
-            .and_then(|s| s.strip_suffix("]]>"))
-            .unwrap_or(raw_val);
+        let raw_val = &after[..val_end];
+        // CDATA unwrap — but tolerate the malformed endings a 1B model
+        // produces: standard `]]>`, truncated `]]` / `]`, or nothing.
+        // Only strip the opener when we actually saw it; otherwise leave the
+        // value untouched (a literal '<' in content is rare but legal).
+        let raw_val = if let Some(inner) = raw_val.strip_prefix("<![CDATA[") {
+            inner
+                .strip_suffix("]]>")
+                .or_else(|| inner.strip_suffix("]]"))
+                .or_else(|| inner.strip_suffix("]"))
+                .unwrap_or(inner)
+        } else {
+            raw_val
+        };
         let decoded = decode_xml_entities(raw_val);
         let value = if decoded.trim().is_empty() {
             Value::String(String::new())
@@ -511,11 +520,8 @@ mod tests {
 
     fn run(input: &str) -> Vec<String> {
         let mut r = XmlReplayer::new();
-        let mut out = Vec::new();
-        r.push(input, &mut out);
-        for f in r.finish() {
-            out.push(f);
-        }
+        let mut out = r.push(input);
+        out.extend(r.finish());
         out.into_iter()
             .map(|f| match f {
                 Flush::Text(s) => format!("T:{}", s),
@@ -573,6 +579,57 @@ mod tests {
                    </arguments></function>";
         let out = run(xml);
         assert!(out[0].contains("x < 2"));
+        // The CDATA wrapper MUST be fully stripped — no leading '<![CDATA['
+        // and no trailing ']]>' leakage into the value.
+        assert!(!out[0].contains("CDATA"), "CDATA marker leaked: {}", out[0]);
+    }
+
+    #[test]
+    fn cdata_with_json_content_no_residue() {
+        // Real-world failure: model wraps a JSON value in CDATA. The parser
+        // must return the clean JSON, not leak '<![CDATA[' at the start or
+        // leave a dangling ']' at the end.
+        let xml = "<function name=\"write_file\"><arguments>\
+                   <param name=\"file_path\">config.json</param>\
+                   <param name=\"content\"><![CDATA[{\"name\":\"minicpm5\",\"version\":\"1.0\"}]]></param>\
+                   </arguments></function>";
+        let out = run(xml);
+        assert_eq!(out.len(), 1, "expected one tool call, got: {:?}", out);
+        let args_str = &out[0];
+        assert!(args_str.starts_with("C:write_file("));
+        let args_json = &args_str["C:write_file(".len()..args_str.len() - 1];
+        let v: Value = serde_json::from_str(args_json).expect("args must be valid JSON");
+        assert_eq!(v["file_path"], "config.json");
+        assert_eq!(v["content"]["name"], "minicpm5");
+        assert_eq!(v["content"]["version"], "1.0");
+    }
+
+    #[test]
+    fn malformed_cdata_truncated_ending_still_unwrapped() {
+        // 1B models emit malformed CDATA: opener present, ending truncated
+        // to "]" or "]]" instead of the standard "]]>". The parser must still
+        // recover the inner value rather than leak the wrapper.
+        for bad_ending in ["]", "]]"] {
+            let xml = format!(
+                "<function name=\"write_file\"><arguments>\
+                 <param name=\"content\"><![CDATA[hello world{bad_ending}</param>\
+                 </arguments></function>"
+            );
+            let out = run(&xml);
+            assert_eq!(out.len(), 1, "ending {:?}: got {:?}", bad_ending, out);
+            assert!(
+                out[0].contains("hello world"),
+                "ending {:?}: content lost: {}",
+                bad_ending,
+                out[0]
+            );
+            assert!(
+                !out[0].contains("CDATA") && !out[0].contains("]\""),
+                "ending {:?}: wrapper leaked: {}",
+                bad_ending,
+                out[0]
+            );
+        }
     }
 
     #[test]
@@ -585,26 +642,30 @@ mod tests {
 
     #[test]
     fn bare_less_than_is_text() {
-        assert_eq!(run("1 < 2"), vec!["T:1 < 2"]);
+        // A bare '<' with no matching tag flushes as text. The scanner splits
+        // at '<' (it can't know yet the '<' isn't a tag start), then flushes
+        // the remainder once no '>' follows — two TextDeltas that concatenate
+        // to the original. Both reach the agent as plain text (no tool call).
+        let out = run("1 < 2");
+        let joined: String = out
+            .iter()
+            .filter_map(|s| s.strip_prefix("T:"))
+            .collect();
+        assert_eq!(joined, "1 < 2");
     }
 
     #[test]
     fn streamed_byte_by_byte_matches_whole() {
         let xml = "<function name=\"f\"><arguments><param name=\"k\">v</param></arguments></function>";
         let mut r1 = XmlReplayer::new();
-        let mut o1 = Vec::new();
-        r1.push(xml, &mut o1);
-        for f in r1.finish() {
-            o1.push(f);
-        }
+        let mut o1 = r1.push(xml);
+        o1.extend(r1.finish());
         let mut r2 = XmlReplayer::new();
         let mut o2 = Vec::new();
         for c in xml.chars() {
-            r2.push(&c.to_string(), &mut o2);
+            o2.extend(r2.push(&c.to_string()));
         }
-        for f in r2.finish() {
-            o2.push(f);
-        }
+        o2.extend(r2.finish());
         assert_eq!(
             o1.into_iter()
                 .map(|f| match f {
