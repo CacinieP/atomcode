@@ -223,7 +223,7 @@ impl LlmProvider for OllamaProvider {
 
 /// Open one `/api/chat` stream, retrying the OPEN (transient status / transport)
 /// per `policy`. Shared by the initial open and the mid-stream re-open.
-async fn open_stream(
+pub(crate) async fn open_stream(
     client: &reqwest::Client,
     url: &str,
     body: &Value,
@@ -345,7 +345,7 @@ fn format_messages(messages: &[Message]) -> Vec<Value> {
 }
 
 /// Build the `/api/chat` request body. Deterministic (BTreeMap-backed `Map`).
-fn build_request_body(
+pub(crate) fn build_request_body(
     model: &str,
     messages: &[Message],
     tools: &[ToolDef],

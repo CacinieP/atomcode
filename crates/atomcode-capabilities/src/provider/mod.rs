@@ -17,6 +17,7 @@
 
 mod anthropic;
 mod atomgit_sign;
+mod minicpm;
 mod ollama;
 mod openai_compat;
 mod reasoning;
@@ -25,6 +26,7 @@ mod sign;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub use atomgit_sign::{atomgit_request_signer, is_atomgit_gateway, signer_available};
+pub use minicpm::MinicpmProvider;
 pub use ollama::{OllamaConfig, OllamaProvider};
 pub use openai_compat::{model_suggests_vision, OpenAiCompatConfig, OpenAiCompatProvider};
 pub use reasoning::{ReasoningPolicy, REASONING_PLACEHOLDER};

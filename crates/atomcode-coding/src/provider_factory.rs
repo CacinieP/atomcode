@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use atomcode_capabilities::provider::{
     atomgit_request_signer, is_atomgit_gateway, signer_available, AnthropicConfig,
-    AnthropicProvider, OllamaConfig, OllamaProvider, OpenAiCompatConfig, OpenAiCompatProvider,
-    ReasoningPolicy, RequestSigner,
+    AnthropicProvider, MinicpmProvider, OllamaConfig, OllamaProvider, OpenAiCompatConfig,
+    OpenAiCompatProvider, ReasoningPolicy, RequestSigner,
 };
 use atomcode_kernel::provider::LlmProvider;
 
@@ -134,6 +134,23 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 oc.skip_tls_verify = cfg.skip_tls_verify;
                 Arc::new(
                     OllamaProvider::new(oc).map_err(|e| ProviderBuildError::Adapter(e.message))?,
+                )
+            }
+            // MiniCPM5-1B via Ollama/llama.cpp. Same /api/chat wire protocol
+            // as `ollama`, but peels the model's inline `<function>` XML out
+            // of `content` and re-emits it as StreamEvent::ToolCall (Ollama's
+            // own `tool_calls` field is empty for MiniCPM5).
+            "minicpm" => {
+                let mut mc = OllamaConfig::new(&cfg.base_url, &cfg.model);
+                mc.api_key = cfg.api_key.clone();
+                mc.context_window = cfg.context_window;
+                mc.idle_timeout = cfg.stream_timeout;
+                mc.max_tokens = Some(default_max_tokens(cfg.context_window));
+                mc.think = cfg.thinking_enabled.unwrap_or(false);
+                mc.user_agent = Some(ua.clone());
+                mc.skip_tls_verify = cfg.skip_tls_verify;
+                Arc::new(
+                    MinicpmProvider::new(mc).map_err(|e| ProviderBuildError::Adapter(e.message))?,
                 )
             }
             _ => {

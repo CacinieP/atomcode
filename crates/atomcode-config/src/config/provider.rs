@@ -122,6 +122,7 @@ impl ProviderConfig {
             "openai" | "openai-compat" | "openai_compat" => "OPENAI_API_KEY",
             "claude" | "anthropic" => "ANTHROPIC_API_KEY",
             "ollama" => "OLLAMA_API_KEY",
+            "minicpm" => "MINICPM_API_KEY",
             _ => "",
         };
 
@@ -215,6 +216,12 @@ fn default_context_window() -> usize {
 pub fn default_context_window_for(provider_type: &str) -> usize {
     match provider_type {
         "ollama" => 8000,
+        // MiniCPM5-1B natively supports 32K context (and up to 128K via
+        // RoPE scaling). atomcode's agent loop needs headroom for the
+        // system prompt + tool schemas + file contents, so default higher
+        // than plain ollama — users running on RAM-constrained machines
+        // can override via `context_window` in config.toml.
+        "minicpm" => 32768,
         _ => 128000,
     }
 }

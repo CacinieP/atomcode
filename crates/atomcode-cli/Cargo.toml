@@ -8,6 +8,14 @@ default-run = "atomcode"
 name = "atomcode"
 path = "src/main.rs"
 
+# MiniCPM5-enabled build — same source, distinct binary name so both can
+# coexist on PATH. Points at the same main.rs; the minicpm provider is
+# compiled in unconditionally (gated only by config.toml's `type = "minicpm"`),
+# so this target is purely a renamed artifact for clarity in local trials.
+[[bin]]
+name = "atomcode-minicpm"
+path = "src/main.rs"
+
 # Thin lib target so integration tests (and the bin) can reach testable
 # modules like `uninstall` (moved here from atomcode-core). A bin-only crate
 # exposes no API to `tests/`, which is why the uninstall manifest used to

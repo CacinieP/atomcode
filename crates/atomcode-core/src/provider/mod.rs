@@ -1,4 +1,5 @@
 pub mod claude;
+pub mod minicpm;
 pub mod ollama;
 pub mod openai;
 pub mod retry;
@@ -544,7 +545,10 @@ mod build_http_client_tls_tests {
 /// credentials instead of a static API key. Async callers must run provider
 /// construction through `tokio::task::spawn_blocking` or a dedicated thread.
 pub fn create_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>> {
-    let mut config = if config.api_key.is_none() && config.provider_type != "ollama" {
+    let mut config = if config.api_key.is_none()
+        && config.provider_type != "ollama"
+        && config.provider_type != "minicpm"
+    {
         // Security: only fall back to the OAuth access_token when the
         // provider talks to a trusted AtomGit gateway. Sending the
         // platform credential to an attacker-controlled base_url would
@@ -600,6 +604,11 @@ pub fn create_provider(config: &ProviderConfig) -> Result<Box<dyn LlmProvider>> 
         "claude" => Ok(Box::new(claude::ClaudeProvider::new(&config)?)),
         "openai" => Ok(Box::new(openai::OpenAiProvider::new(&config)?)),
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new(&config)?)),
+        // MiniCPM5-1B served via Ollama/llama.cpp. Same /api/chat wire
+        // protocol as `ollama`, but peels the model's inline `<function>`
+        // XML out of `content` and re-emits it as StreamEvent::ToolCall*
+        // (Ollama's own `tool_calls` field is empty for MiniCPM5).
+        "minicpm" => Ok(Box::new(minicpm::MinicpmProvider::new(&config)?)),
         other => anyhow::bail!("Unknown provider type: {}", other),
     }
 }
