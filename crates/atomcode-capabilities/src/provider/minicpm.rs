@@ -87,6 +87,13 @@ impl LlmProvider for MinicpmProvider {
             options,
             &self.cfg,
         );
+        // Inject the XML tool-call format guide. MiniCPM5 will NOT emit the
+        // `<function>` XML unless explicitly taught — without this, the model
+        // either fabricates ("已创建文件" with no actual tool call) or truncates
+        // arguments. Evaluated at 40%→70% success rate lift (see EVAL_REPORT).
+        // Prepended to the existing system prompt so the user's project rules
+        // (AGENTS.md) still apply on top.
+        inject_format_guide(&mut body);
         // Ollama's MiniCPM5 GGUF defaults to num_ctx=4096, but atomcode's
         // system prompt + tool schemas alone exceed that. Force the context
         // window to the configured value (32768 default) so the request
@@ -170,6 +177,58 @@ impl LlmProvider for MinicpmProvider {
         let _ = tools;
         Ok(s.boxed())
     }
+}
+
+/// The XML tool-call format guide injected into every MiniCPM5 request.
+///
+/// Kept deliberately short (under ~400 tokens) — MiniCPM5-1B's instruction
+/// following degrades fast with context length, so the guide must be dense.
+/// Empirically tuned: this exact text lifted single-tool success from 40%
+/// to 70% in a 10-round eval (see EVAL_REPORT.md). The two load-bearing
+/// parts are (a) the explicit "no `<function>` tag → tool won't run"
+/// warning, which suppresses fabricated "已完成" answers, and (b) the
+/// complete worked example, which suppresses argument truncation.
+const FORMAT_GUIDE: &str = "\
+【工具调用规则 — 极其重要】\n\
+你要通过调用工具来完成任务。调用工具的唯一方式是输出这种 XML：\n\
+<function name=\"工具名\"><arguments><param name=\"参数名\">参数值</param></arguments></function>\n\n\
+⚠️ 如果不输出 <function 标签，工具就不会执行，任务会失败。不要只说\"已创建\"——必须真的输出 <function 标签。\n\
+⚠️ 参数（尤其是 content）必须完整传递，不要截断。\n\n\
+可用工具：write_file(file_path,content) / read_file(file_path) / edit_file(file_path,old_string,new_string) / bash(command) / glob(pattern) / grep(pattern,path)\n\n\
+示例：\n\
+用户：创建 demo.txt 内容 Hello World\n\
+助手：<function name=\"write_file\"><arguments><param name=\"file_path\">demo.txt</param><param name=\"content\">Hello World</param></arguments></function>\n";
+
+/// Prepend [`FORMAT_GUIDE`] to the request's first system message, or insert
+/// a new system message at index 0 if none exists. Mutates `body` in place.
+///
+/// Prepending (vs appending) puts the guide in the higher-recency position,
+/// which matters for a 1B model whose attention to early context is stronger.
+/// The user's own system content (AGENTS.md, persona) is preserved verbatim
+/// immediately after the guide.
+fn inject_format_guide(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    let guide_prefix = format!("{FORMAT_GUIDE}\n");
+    // Find the first system message and prepend the guide to its content.
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("system") {
+            if let Some(content) = msg.get_mut("content").and_then(|c| c.as_str()) {
+                // Avoid double-injecting if the guide is already present
+                // (idempotency across retries that reuse the body).
+                if !content.contains("【工具调用规则") {
+                    *msg = serde_json::json!({
+                        "role": "system",
+                        "content": format!("{guide_prefix}{content}"),
+                    });
+                }
+            }
+            return;
+        }
+    }
+    // No system message — insert one at the front.
+    messages.insert(0, serde_json::json!({"role": "system", "content": guide_prefix.trim_end()}));
 }
 
 /// NDJSON decoder that intercepts MiniCPM5's inline `<function>` / `<think>`
@@ -517,6 +576,7 @@ fn decode_xml_entities(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn run(input: &str) -> Vec<String> {
         let mut r = XmlReplayer::new();
@@ -680,5 +740,67 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
         );
+    }
+
+    // ── inject_format_guide ──────────────────────────────────────────
+
+    fn body_with_system(system_content: &str) -> Value {
+        json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": "do the task"},
+            ],
+        })
+    }
+
+    #[test]
+    fn inject_prepends_guide_to_existing_system_message() {
+        let mut body = body_with_system("project rules: use rust");
+        inject_format_guide(&mut body);
+        let sys = &body["messages"][0];
+        assert_eq!(sys["role"], "system");
+        let content = sys["content"].as_str().unwrap();
+        // Guide comes first (high recency for the 1B model).
+        assert!(content.starts_with("【工具调用规则"));
+        // Original system content is preserved verbatim after the guide.
+        assert!(content.contains("project rules: use rust"));
+    }
+
+    #[test]
+    fn inject_inserts_system_message_when_none_exists() {
+        let mut body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        inject_format_guide(&mut body);
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert!(body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("【工具调用规则"));
+        assert_eq!(body["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn inject_is_idempotent_across_retries() {
+        let mut body = body_with_system("my rules");
+        inject_format_guide(&mut body);
+        let after_first = body["messages"][0]["content"].as_str().unwrap().to_string();
+        inject_format_guide(&mut body);
+        let after_second = body["messages"][0]["content"].as_str().unwrap();
+        assert_eq!(after_first, after_second, "guide must not duplicate");
+        assert_eq!(
+            after_second.matches("【工具调用规则").count(),
+            1,
+            "marker should appear exactly once"
+        );
+    }
+
+    #[test]
+    fn inject_is_noop_when_messages_missing() {
+        let mut body = json!({"model": "m"});
+        inject_format_guide(&mut body);
+        assert!(body.get("messages").is_none());
     }
 }
